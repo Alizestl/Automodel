@@ -36,6 +36,7 @@ from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_cha
 from nemo_automodel.components.datasets.loader import DatasetConfig, TokenizerDatasetConfig
 from nemo_automodel.components.datasets.packing import (
     DEFAULT_PACKED_SEQUENCE_CONTRACT,
+    BatchOutputFormat,
     PackedSequenceContract,
     resolve_packing_contract,
 )
@@ -279,11 +280,21 @@ class VlmDataloaderConfig:
     chat_template: str | None = None
     shuffle: bool = True
     num_workers: int = 0
-    """Worker processes per dataloader; zero selects the available CPU count with a warning."""
+    """Worker processes per dataloader; zero selects available CPUs, capped at 4 * visible GPUs when present."""
     pin_memory: bool = False
     persistent_workers: bool = False
     prefetch_factor: int | None = None
     drop_last: bool = False
+
+    @property
+    def is_packed(self) -> bool:
+        """Whether this loader emits packed multimodal inputs."""
+        return self.packing is not None
+
+    @property
+    def output_format(self) -> BatchOutputFormat:
+        """Selected native batch representation, independent of the packing algorithm."""
+        return "thd" if self.packing is not None and self.packing.packing_format == "thd" else "batched"
 
     def _build_source(
         self,
@@ -345,7 +356,8 @@ class VlmDataloaderConfig:
             packing_attn_implementation: Deprecated attention-backend name
                 retained for Python-call compatibility.
             packing_contract: Structural model contract used for packed-mask construction.
-                Defaults to block-causal masking without packed-sequence metadata.
+                Native mask/Flash collation requires a model-derived contract supplying
+            the attention conversion; recipes provide it automatically.
             pp_n_microbatches: Optional pipeline microbatch count used to pre-chunk media tensors.
             cp_size: Runtime context-parallel world size. Neat-packed CP uses
                 compact document IDs instead of a dense quadratic attention mask;
@@ -436,13 +448,18 @@ class VlmDataloaderConfig:
                 available_cpus = len(os.sched_getaffinity(0))
             except (AttributeError, OSError, NotImplementedError):
                 available_cpus = None
-            num_workers = available_cpus or os.cpu_count() or 1
+            num_cpus = available_cpus or os.cpu_count() or 1
+            num_gpus = torch.cuda.device_count()
+            num_workers = min(4 * num_gpus, num_cpus) if num_gpus > 0 else num_cpus
             logger.warning(
-                "VLM dataloader num_workers=0 disables background preprocessing and prefetching; "
-                "using num_workers=%d based on the CPUs available to this process. "
+                "VLM dataloader num_workers=0 selects automatic preprocessing and prefetching; "
+                "using num_workers=%d with %d visible GPUs and %d available CPUs "
+                "(capped at 4 workers per visible GPU when GPUs are available). "
                 "This count is per dataloader; set an explicit positive num_workers "
-                "to limit workers when training ranks share CPUs.",
+                "to override the automatic selection.",
                 num_workers,
+                num_gpus,
+                num_cpus,
             )
         dataloader = _VlmStatefulDataloader(
             dataset=dataset,
@@ -451,8 +468,8 @@ class VlmDataloaderConfig:
             batch_size=batch_size,
             num_workers=num_workers,
             pin_memory=self.pin_memory,
-            persistent_workers=self.persistent_workers,
-            prefetch_factor=self.prefetch_factor,
+            persistent_workers=self.persistent_workers and num_workers > 0,
+            prefetch_factor=self.prefetch_factor if num_workers > 0 else None,
             drop_last=self.drop_last,
         )
         return VlmDataloaderBuild(dataloader=dataloader, processor=processor)
